@@ -1,0 +1,7 @@
+services:
+  ollama:
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      # Ollama enables Vulkan automatically when GPU devices are accessible.
+      OLLAMA_DEBUG: ${OLLAMA_DEBUG:-0}

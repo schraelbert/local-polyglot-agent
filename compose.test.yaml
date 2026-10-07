@@ -1,0 +1,7 @@
+services:
+  smoke-helper:
+    image: ${SMOKE_IMAGE:?SMOKE_IMAGE must be set by versions.env}
+    profiles: ["test"]
+    entrypoint: ["curl"]
+    volumes:
+      - ./tests/fixtures:/fixtures:ro

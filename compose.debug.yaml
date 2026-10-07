@@ -1,0 +1,11 @@
+# Opt-in host API exposure for local debugging only.
+services:
+  ollama:
+    ports:
+      - "127.0.0.1:${OLLAMA_PORT:-11434}:11434"
+
+  docling:
+    ports:
+      - "127.0.0.1:${DOCLING_PORT:-5001}:5001"
+    environment:
+      DOCLING_SERVE_ENABLE_UI: "true"

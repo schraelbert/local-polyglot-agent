@@ -1,0 +1,264 @@
+services:
+  ollama:
+    image: ${OLLAMA_IMAGE:?OLLAMA_IMAGE must be set by versions.env}
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-16384}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-5m}
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-1}
+      OLLAMA_NO_CLOUD: ${OLLAMA_NO_CLOUD:-1}
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE:-10m}
+        max-file: ${LOG_MAX_FILES:-3}
+
+  # One-shot initializer. Open WebUI does not depend on its success so an
+  # already-provisioned installation can still start when temporarily offline.
+  model-init:
+    image: ${OLLAMA_IMAGE:?OLLAMA_IMAGE must be set by versions.env}
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      CHAT_MODEL: ${CHAT_MODEL:-qwen3.5:9b-q4_K_M}
+      VISION_CHAT_MODEL: ${VISION_CHAT_MODEL:-qwen3-vl:4b-instruct}
+      KNOWLEDGE_CHAT_MODEL: ${KNOWLEDGE_CHAT_MODEL:-qwen2.5:7b}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
+      AGENT_MODEL: ${AGENT_MODEL:-polyglot-agent:latest}
+      KNOWLEDGE_AGENT_MODEL: ${KNOWLEDGE_AGENT_MODEL:-polyglot-agent-knowledge:latest}
+      VISION_AGENT_MODEL: ${VISION_AGENT_MODEL:-polyglot-agent-vision:latest}
+      AGENT_PROMPT_FILE: /config/agent/system-prompt.md
+      FORCE_MODEL_UPDATE: ${FORCE_MODEL_UPDATE:-0}
+    volumes:
+      - ./scripts/pull-models.sh:/pull-models.sh:ro
+      - ./config/agent/system-prompt.md:/config/agent/system-prompt.md:ro
+    entrypoint: ["/bin/sh", "/pull-models.sh"]
+    restart: "no"
+
+
+
+  # One-shot local literature corpus provisioner. The corpus is used only for
+  # exact source retrieval when a user refers to a public-domain work that was
+  # identified in the conversation but whose complete text is not present in
+  # chat history (for example, "translate the whole poem").
+  literature-corpus-init:
+    image: ${OPEN_WEBUI_IMAGE:?OPEN_WEBUI_IMAGE must be set by versions.env}
+    user: "0"
+    environment:
+      LITERATURE_CORPUS_DIR: /corpus
+      LITERATURE_CORPUS_URL: ${LITERATURE_CORPUS_URL:-https://codeload.github.com/open-chinese/poetry-collection/tar.gz/refs/heads/main}
+      LITERATURE_CORPUS_SOURCE: ${LITERATURE_CORPUS_SOURCE:-open-chinese/poetry-collection}
+      LITERATURE_CORPUS_REV: ${LITERATURE_CORPUS_REV:-1}
+      LITERATURE_CORPUS_MIN_WORKS: ${LITERATURE_CORPUS_MIN_WORKS:-100000}
+      FORCE_LITERATURE_CORPUS_UPDATE: ${FORCE_LITERATURE_CORPUS_UPDATE:-0}
+    volumes:
+      - literature-corpus:/corpus
+      - ./scripts/prefetch-literature-corpus.py:/prefetch-literature-corpus.py:ro
+    entrypoint: ["python3", "/prefetch-literature-corpus.py"]
+    restart: "no"
+
+  # Curated Ollama-compatible endpoint for Open WebUI. It exposes only one
+  # public agent. Text conversations use a sticky first-user-language anchor so
+  # normal follow-ups keep the same model/history. Translation is a tool path:
+  # self-contained requests bypass directly, while contextual translation first
+  # resolves source text through the anchor and then hands it to Qwen3.5. Images
+  # bypass to the vision agent.
+  model-router:
+    image: ${OPEN_WEBUI_IMAGE:?OPEN_WEBUI_IMAGE must be set by versions.env}
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+      literature-corpus-init:
+        condition: service_completed_successfully
+    environment:
+      OLLAMA_UPSTREAM: http://ollama:11434
+      PUBLIC_MODEL: ${AGENT_MODEL:-polyglot-agent:latest}
+      TRANSLATION_MODEL: ${AGENT_MODEL:-polyglot-agent:latest}
+      TEXT_MODEL: ${AGENT_MODEL:-polyglot-agent:latest}
+      KNOWLEDGE_MODEL: ${KNOWLEDGE_AGENT_MODEL:-polyglot-agent-knowledge:latest}
+      VISION_MODEL: ${VISION_AGENT_MODEL:-polyglot-agent-vision:latest}
+      ROUTER_PORT: "11434"
+      ROUTER_UPSTREAM_TIMEOUT: ${SMOKE_MODEL_TIMEOUT:-300}
+      CONTEXT_RESOLVE_NUM_PREDICT: ${CONTEXT_RESOLVE_NUM_PREDICT:-1024}
+      CONTEXT_SOURCE_MAX_CHARS: ${CONTEXT_SOURCE_MAX_CHARS:-12000}
+      LITERATURE_CORPUS_DB: /corpus/poetry.sqlite3
+      TEXT_THINKING_DEFAULT: ${TEXT_THINKING_DEFAULT:-false}
+    volumes:
+      - literature-corpus:/corpus:ro
+      - ./scripts/model-router.py:/app/model-router.py:ro
+      - ./scripts/e2e-dialogue-benchmark.py:/app/e2e-dialogue-benchmark.py:ro
+    entrypoint: ["python3", "/app/model-router.py"]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:11434/health\",timeout=3).read()'",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE:-10m}
+        max-file: ${LOG_MAX_FILES:-3}
+
+  # Prefetches the local Docling model artifacts once. A marker in the named
+  # volume lets later starts work without network access. Bump
+  # DOCLING_PREFETCH_REV when the required artifact set changes.
+  docling-model-init:
+    image: ${DOCLING_IMAGE:?DOCLING_IMAGE must be set by versions.env}
+    # The upstream image runs as UID 1001, while a fresh Docker named volume
+    # is root-owned. This one-shot job runs as root only so it can seed and
+    # populate the artifacts volume. The long-running Docling service below
+    # continues to run as the non-root user baked into the upstream image.
+    user: "0"
+    environment:
+      DOCLING_PREFETCH_REV: ${DOCLING_PREFETCH_REV:-3}
+      FORCE_DOCLING_MODEL_UPDATE: ${FORCE_DOCLING_MODEL_UPDATE:-0}
+    volumes:
+      - docling-artifacts:/artifacts
+      - ./scripts/prefetch-docling.sh:/prefetch-docling.sh:ro
+    entrypoint: ["/bin/sh", "/prefetch-docling.sh"]
+    restart: "no"
+
+  docling:
+    image: ${DOCLING_IMAGE:?DOCLING_IMAGE must be set by versions.env}
+    restart: unless-stopped
+    depends_on:
+      docling-model-init:
+        condition: service_completed_successfully
+    environment:
+      DOCLING_SERVE_ENABLE_UI: ${DOCLING_ENABLE_UI:-false}
+      DOCLING_SERVE_API_KEY: ${DOCLING_API_KEY}
+      DOCLING_SERVE_ENABLE_REMOTE_SERVICES: "false"
+      DOCLING_SERVE_ALLOW_EXTERNAL_PLUGINS: "false"
+      DOCLING_SERVE_ARTIFACTS_PATH: /artifacts
+      DOCLING_SERVE_OTEL_ENABLE_METRICS: "false"
+      DOCLING_SERVE_OTEL_ENABLE_PROMETHEUS: "false"
+      DOCLING_SERVE_MAX_NUM_PAGES: ${DOCLING_MAX_NUM_PAGES:-1000}
+      DOCLING_SERVE_MAX_FILE_SIZE: ${DOCLING_MAX_FILE_SIZE:-262144000}
+      DOCLING_SERVE_MAX_SYNC_WAIT: ${DOCLING_MAX_SYNC_WAIT:-600}
+      DOCLING_SERVE_ENG_LOC_NUM_WORKERS: ${DOCLING_WORKERS:-1}
+      UVICORN_WORKERS: "1"
+      OMP_NUM_THREADS: ${DOCLING_THREADS:-4}
+      MKL_NUM_THREADS: ${DOCLING_THREADS:-4}
+    volumes:
+      - docling-artifacts:/artifacts:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c 'import os,urllib.request; r=urllib.request.Request(\"http://127.0.0.1:5001/ready\",headers={\"X-Api-Key\":os.environ[\"DOCLING_SERVE_API_KEY\"]}); urllib.request.urlopen(r,timeout=3).read()'",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE:-10m}
+        max-file: ${LOG_MAX_FILES:-3}
+
+  open-webui:
+    image: ${OPEN_WEBUI_IMAGE:?OPEN_WEBUI_IMAGE must be set by versions.env}
+    restart: unless-stopped
+    depends_on:
+      model-router:
+        condition: service_healthy
+      docling:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${WEBUI_PORT:-3000}:8080"
+    volumes:
+      - open-webui-data:/app/backend/data
+    environment:
+      WEBUI_NAME: ${WEBUI_NAME:-Local Polyglot Agent}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+      WEBUI_ADMIN_EMAIL: ${WEBUI_ADMIN_EMAIL:-admin@local.invalid}
+      WEBUI_ADMIN_PASSWORD: ${WEBUI_ADMIN_PASSWORD}
+      WEBUI_ADMIN_NAME: ${WEBUI_ADMIN_NAME:-Local Admin}
+      WEBUI_URL: http://localhost:${WEBUI_PORT:-3000}
+      CORS_ALLOW_ORIGIN: http://localhost:${WEBUI_PORT:-3000};http://127.0.0.1:${WEBUI_PORT:-3000}
+      ENABLE_SIGNUP: "false"
+      DEFAULT_MODELS: ${AGENT_MODEL:-polyglot-agent:latest}
+      ENABLE_MODEL_FILTER: "true"
+      MODEL_FILTER_LIST: ${AGENT_MODEL:-polyglot-agent:latest}
+      ENABLE_EVALUATION_ARENA_MODELS: "false"
+      ENABLE_OPENAI_API: "false"
+      OLLAMA_BASE_URL: http://model-router:11434
+      RAG_EMBEDDING_ENGINE: ollama
+      RAG_EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
+      RAG_OLLAMA_BASE_URL: http://ollama:11434
+      ENABLE_PERSISTENT_CONFIG: ${ENABLE_PERSISTENT_CONFIG:-false}
+      RAG_TEXT_SPLITTER: ${RAG_TEXT_SPLITTER:-character}
+      ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER: ${ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER:-true}
+      CHUNK_SIZE: ${CHUNK_SIZE:-1200}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-150}
+      RAG_TOP_K: ${RAG_TOP_K:-5}
+      RAG_FILE_MAX_SIZE: ${RAG_FILE_MAX_SIZE:-250}
+      RAG_FILE_MAX_COUNT: ${RAG_FILE_MAX_COUNT:-10}
+      CONTENT_EXTRACTION_ENGINE: docling
+      DOCLING_SERVER_URL: http://docling:5001
+      DOCLING_API_KEY: ${DOCLING_API_KEY}
+      DOCLING_PARAMS: ${DOCLING_PARAMS}
+      SCARF_NO_ANALYTICS: ${SCARF_NO_ANALYTICS:-true}
+      DO_NOT_TRACK: ${DO_NOT_TRACK:-true}
+      ANONYMIZED_TELEMETRY: ${ANONYMIZED_TELEMETRY:-false}
+      ENABLE_VERSION_UPDATE_CHECK: ${ENABLE_VERSION_UPDATE_CHECK:-false}
+      ENABLE_WEB_SEARCH: ${ENABLE_WEB_SEARCH:-false}
+      ENABLE_CODE_EXECUTION: ${ENABLE_CODE_EXECUTION:-false}
+      # This deployment intentionally exposes no Open WebUI agentic/tool surface to
+      # the small local chat models. File Context/RAG remains enabled separately.
+      # The router also strips any client-supplied tool schema as a defense in depth.
+      DEFAULT_MODEL_METADATA: '{"capabilities":{"builtin_tools":false,"file_context":true},"builtinTools":{"tasks":false}}'
+      ENABLE_PLUGINS: "false"
+    healthcheck:
+      # Match the upstream Open WebUI image health probe. /health returns 200
+      # only after the backend, database, and application startup are ready.
+      test:
+        [
+          "CMD-SHELL",
+          "curl --silent --fail http://127.0.0.1:8080/health >/dev/null",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE:-10m}
+        max-file: ${LOG_MAX_FILES:-3}
+
+  # Maintenance-only utility. It is never started by normal `docker compose up`.
+  backup-helper:
+    image: ${MAINTENANCE_IMAGE:?MAINTENANCE_IMAGE must be set by versions.env}
+    profiles: ["maintenance"]
+    volumes:
+      - open-webui-data:/volumes/open-webui
+      - ollama-data:/volumes/ollama
+      - docling-artifacts:/volumes/docling-artifacts
+      - ./backups:/backups
+    entrypoint: ["/bin/sh", "-c"]
+
+volumes:
+  ollama-data:
+  open-webui-data:
+  docling-artifacts:
+  literature-corpus:

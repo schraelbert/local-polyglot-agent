@@ -1,0 +1,51 @@
+# Local secrets and machine-specific runtime configuration
+.env
+.env.*
+!.env.example
+.runtime.env
+.running.env
+.env.pre-restore.*
+.envrc
+.direnv/
+
+# Secret-bearing backups and local benchmark output
+backups/
+benchmark-results/
+
+# Local model / application data if bind-mounted during debugging
+.ollama/
+open-webui-data/
+docling-artifacts/
+literature-corpus/
+poetry.sqlite3
+poetry.sqlite3-*
+.literature-corpus-ready.json
+
+# Python caches / virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Tooling / editor state
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs and temporary files
+*.log
+*.tmp
+.cache/
+
+# Local exports that may contain user data or secrets
+chat-export*/
+exports/
+volumes.tar.gz
